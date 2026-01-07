@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { SourceType, ActivityItem } from '../types';
-import { Plus, FolderOpen, HelpCircle, ChevronDown, ChevronRight, Database, Loader2, FileText, AlertTriangle } from 'lucide-react';
+import { Plus, FolderOpen, HelpCircle, ChevronDown, ChevronRight, Loader2, AlertTriangle } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import JSZip from 'jszip';
 import { QuoteDisplay } from './QuoteDisplay';
@@ -8,21 +8,18 @@ import { QuoteDisplay } from './QuoteDisplay';
 interface ImporterProps {
   onImport: (items: ActivityItem[]) => void;
   onSetGlobalLoading: (active: boolean, mode?: 'importing', step?: number, total?: number, label?: string) => void;
-  // New props for local loading state
   isImporting: boolean;
   loadingLabel: string;
 }
 
 const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImporting, loadingLabel }) => {
-  const [activeTab, setActiveTab] = useState<'manual' | 'github' | 'file' | 'cursor'>('manual');
+  // Removed 'github' and 'cursor' tabs
+  const [activeTab, setActiveTab] = useState<'manual' | 'file'>('manual');
   const [showGuide, setShowGuide] = useState<string | null>(null);
   
-  // Manual Input State - Default to ChatGPT as requested
+  // Manual Input State
   const [manualText, setManualText] = useState('');
   const [selectedSource, setSelectedSource] = useState<SourceType>(SourceType.CHATGPT);
-
-  // GitHub State
-  const [githubUsername, setGithubUsername] = useState('');
 
   // File Input State
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -42,7 +39,6 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
     if (!manualText.trim()) return;
 
     // INTELLIGENT KEY DETECTION
-    // Check every line to see if it looks like an API Key
     const lines = manualText.split('\n').filter(line => line.trim().length > 0);
     const hasPotentialKey = lines.some(line => {
         const trimmed = line.trim();
@@ -65,51 +61,17 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
     setManualText('');
   };
 
-  const handleGithubImport = async () => {
-    if (!githubUsername) return;
-    onSetGlobalLoading(true, 'importing', 0, 1, `連線 GitHub: ${githubUsername}`);
-    
-    try {
-      const response = await fetch(`https://api.github.com/users/${githubUsername}/events?per_page=100`);
-      if (!response.ok) throw new Error('API 限制或使用者不存在');
-      const events = await response.json();
-      const newItems: ActivityItem[] = events.map((event: any) => {
-        let content = event.type;
-        if (event.type === 'PushEvent') content = `推送至 ${event.repo.name}: ${event.payload.commits?.[0]?.message || 'updates'}`;
-        else if (event.type === 'CreateEvent') content = `在 ${event.repo.name} 建立 ${event.payload.ref_type}`;
-        else if (event.type === 'PullRequestEvent') content = `PR ${event.payload.action} ${event.repo.name}: ${event.payload.pull_request.title}`;
-        else if (event.type === 'WatchEvent') content = `Star ${event.repo.name}`;
-        
-        return {
-          id: uuidv4(),
-          source: SourceType.GITHUB,
-          rawContent: content,
-          date: event.created_at,
-          analyzed: false
-        };
-      });
-      onImport(newItems);
-    } catch (error) {
-      alert('無法讀取 GitHub 資料。建議改用 ZIP 上傳方式匯入更多歷史資料。');
-    } finally {
-      onSetGlobalLoading(false);
-    }
-  };
-
   const findBestTitle = (item: any): string => {
     if (item.title && typeof item.title === 'string' && item.title.trim().length > 0) return item.title;
     if (item.name && typeof item.name === 'string' && item.name.trim().length > 0) return item.name;
     if (item.summary && typeof item.summary === 'string' && item.summary.trim().length > 0) return item.summary;
     
-    // 如果找不到標題，嘗試深入挖掘對話內容的第一句 User message
     if (item.mapping) {
         try {
             const nodes = Object.values(item.mapping) as any[];
-            // 找出第一個 user 發送的訊息
             const userMsg = nodes.find(n => n.message?.author?.role === 'user' && n.message?.content?.parts);
             if (userMsg) {
                 const text = userMsg.message.content.parts.join(' ');
-                // 回傳前 150 個字，讓 AI 有更多上下文可以判斷
                 return text.slice(0, 150);
             }
         } catch (e) {}
@@ -151,68 +113,17 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
       }));
   };
 
-   const extractTextFromCursorJson = (obj: any): string[] => {
-      const results: string[] = [];
-      if (!obj) return results;
-      if (typeof obj === 'string' && obj.length > 50 && !obj.startsWith('{')) results.push(obj);
-      if (Array.isArray(obj)) obj.forEach(item => results.push(...extractTextFromCursorJson(item)));
-      if (typeof obj === 'object') {
-          if (obj.text) results.push(obj.text);
-          if (obj.content) results.push(obj.content);
-          Object.values(obj).forEach(val => results.push(...extractTextFromCursorJson(val)));
-      }
-      return results;
-  };
-
-  const processSqliteFile = async (file: File): Promise<ActivityItem[]> => {
-      try {
-        const buffer = await file.arrayBuffer();
-        if (!(window as any).initSqlJs) return [];
-        const SQL = await (window as any).initSqlJs({ locateFile: () => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.0/sql-wasm.wasm` });
-        const db = new SQL.Database(new Uint8Array(buffer));
-        const stmt = db.prepare("SELECT key, value FROM ItemTable");
-        const newItems: ActivityItem[] = [];
-        const fileDate = new Date(file.lastModified);
-        while (stmt.step()) {
-            const row = stmt.getAsObject();
-            const value = row.value as string;
-            if (value && (value.includes('chat') || value.includes('user'))) {
-                try {
-                    const texts = extractTextFromCursorJson(JSON.parse(value));
-                    if (texts.length > 0) {
-                        newItems.push({
-                            id: uuidv4(),
-                            source: SourceType.CURSOR,
-                            rawContent: `Cursor: ${texts[0].slice(0, 200)}`,
-                            date: fileDate.toISOString(),
-                            analyzed: false
-                        });
-                    }
-                } catch (e) {}
-            }
-        }
-        stmt.free(); db.close();
-        return newItems;
-      } catch (err) { return []; }
-  };
-
   const processSingleFile = async (file: File): Promise<ActivityItem[]> => {
     const fileName = file.name.toLowerCase();
-    
-    // 1. Cursor SQLite
-    if (fileName.endsWith('.vscdb') || (activeTab === 'cursor' && !fileName.includes('.'))) {
-        return await processSqliteFile(file);
-    }
-    
     let newItems: ActivityItem[] = [];
     
-    // 2. ZIP (Claude/Notion/ChatGPT - Legacy)
+    // 1. ZIP (Claude/Notion/ChatGPT)
     if (fileName.endsWith('.zip')) {
         const zip = new JSZip();
         const loadedZip = await zip.loadAsync(file);
         const files = Object.values(loadedZip.files) as any[];
         
-        // Check for conversations.json (ChatGPT format) - fallback to selectedSource
+        // Check for conversations.json (ChatGPT format)
         const chatGptFile = files.find(f => f.name.endsWith('conversations.json') || f.name.endsWith('chat.json'));
         if (chatGptFile) {
             const text = await chatGptFile.async('string');
@@ -238,17 +149,17 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
              }
         }
     } 
-    // 3. JSON (Gemini)
+    // 2. JSON
     else if (fileName.endsWith('.json')) {
         const text = await file.text();
         newItems = parseJsonData(JSON.parse(text), selectedSource, new Date(file.lastModified));
     } 
-    // 4. CSV (Notion/Excel)
+    // 3. CSV
     else if (fileName.endsWith('.csv')) {
         const text = await file.text();
         newItems = parseCsvText(text, fileName.includes('notion') ? SourceType.NOTION : selectedSource, new Date(file.lastModified));
     }
-    // 5. Markdown (Notion/Obsidian)
+    // 4. Markdown
     else if (fileName.endsWith('.md')) {
         const text = await file.text();
         newItems.push({
@@ -267,18 +178,13 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
       if (!fileList || fileList.length === 0) return;
       
       const files = Array.from(fileList);
-      // Initialize Global Loading -> App updates 'processState', passing isImporting=true back here
       onSetGlobalLoading(true, 'importing', 0, files.length, '準備開始處理檔案...');
 
       const allNewItems: ActivityItem[] = [];
       try {
           for (let i = 0; i < files.length; i++) {
-              // Update status for current file
               onSetGlobalLoading(true, 'importing', i + 1, files.length, `分析中: ${files[i].name}`);
-              
-              // Give UI a moment to render
               await new Promise(r => setTimeout(r, 100));
-              
               const items = await processSingleFile(files[i]);
               allNewItems.push(...items);
           }
@@ -330,11 +236,10 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
         匯入數位足跡
       </h2>
 
+      {/* Simplified Tabs */}
       <div className="flex gap-2 mb-6 border-b border-slate-700 pb-2 overflow-x-auto">
         <button onClick={() => setActiveTab('manual')} className={`px-3 py-1.5 text-sm font-medium rounded-md whitespace-nowrap ${activeTab === 'manual' ? 'bg-slate-700 text-indigo-400' : 'text-slate-400'}`}>貼上文字</button>
         <button onClick={() => setActiveTab('file')} className={`px-3 py-1.5 text-sm font-medium rounded-md whitespace-nowrap ${activeTab === 'file' ? 'bg-slate-700 text-indigo-400' : 'text-slate-400'}`}>上傳檔案</button>
-        <button onClick={() => setActiveTab('cursor')} className={`px-3 py-1.5 text-sm font-medium rounded-md whitespace-nowrap ${activeTab === 'cursor' ? 'bg-slate-700 text-indigo-400' : 'text-slate-400'}`}>Cursor</button>
-        <button onClick={() => setActiveTab('github')} className={`px-3 py-1.5 text-sm font-medium rounded-md whitespace-nowrap ${activeTab === 'github' ? 'bg-slate-700 text-indigo-400' : 'text-slate-400'}`}>GitHub</button>
       </div>
 
       {activeTab === 'file' && (
@@ -356,7 +261,6 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
                 </select>
              </div>
 
-            {/* TRANSFORMING DROPZONE */}
             {isImporting ? (
                 <div className="border-2 border-dashed border-indigo-500/50 bg-slate-900/50 p-8 text-center rounded-xl flex flex-col items-center justify-center min-h-[250px] animate-pulse">
                     <Loader2 className="w-10 h-10 text-indigo-400 animate-spin mb-4" />
@@ -378,7 +282,7 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
                         ref={fileInputRef} 
                         className="hidden" 
                         multiple 
-                        accept=".zip,.json,.csv,.txt,.md,.vscdb" 
+                        accept=".zip,.json,.csv,.txt,.md" 
                         onChange={(e) => handleFiles(e.target.files)} 
                     />
                     <FolderOpen className="w-10 h-10 text-slate-400 mx-auto mb-3" />
@@ -391,7 +295,6 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
         </div>
       )}
 
-      {/* Manual, Cursor, GitHub tabs... */}
       {activeTab === 'manual' && (
          <div className="space-y-4">
              <div className="flex items-center gap-2 mb-2">
@@ -401,7 +304,6 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
                 </select>
              </div>
              
-             {/* Key Detection Warning UI happens in alert() on click, but we can also add a hint */}
              <div className="relative">
                  <textarea 
                     value={manualText} 
@@ -418,31 +320,6 @@ const Importer: React.FC<ImporterProps> = ({ onImport, onSetGlobalLoading, isImp
 
              <button onClick={handleManualImport} disabled={!manualText.trim()} className="w-full bg-indigo-600 text-white py-2 rounded-lg">加入</button>
          </div>
-      )}
-      {activeTab === 'cursor' && (
-          <div className="space-y-4">
-            <div onClick={() => fileInputRef.current?.click()} className="border-2 border-dashed border-slate-700 bg-slate-900/50 p-8 text-center rounded-xl cursor-pointer">
-                 <input type="file" ref={fileInputRef} className="hidden" accept=".vscdb" onChange={(e) => handleFiles(e.target.files)} />
-                 <Database className="w-8 h-8 text-indigo-400 mx-auto" />
-                 <p className="mt-2 text-sm text-slate-300">上傳 state.vscdb</p>
-                 <p className="text-xs text-slate-500 mt-1">位於 %APPDATA%/Cursor/User/globalStorage/state.vscdb</p>
-            </div>
-          </div>
-      )}
-      {activeTab === 'github' && (
-           <div className="space-y-4">
-               {isImporting ? (
-                    <div className="border border-slate-700 bg-slate-900/50 p-6 rounded-xl flex flex-col items-center justify-center min-h-[150px]">
-                        <Loader2 className="w-8 h-8 text-indigo-400 animate-spin mb-3" />
-                        <p className="text-slate-300">{loadingLabel}</p>
-                    </div>
-               ) : (
-                    <>
-                        <input type="text" value={githubUsername} onChange={(e) => setGithubUsername(e.target.value)} placeholder="GitHub Username" className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2" />
-                        <button onClick={handleGithubImport} disabled={!githubUsername} className="w-full bg-slate-700 text-white py-2 rounded-lg">抓取</button>
-                    </>
-               )}
-           </div>
       )}
     </div>
   );
