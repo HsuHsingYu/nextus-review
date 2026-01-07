@@ -1,0 +1,5 @@
+{
+  "name": "Nexus Review",
+  "description": "整合 GitHub、AI 工具與筆記軟體的足跡，透過 Gemini 分析並生成 Notion 年度回顧。",
+  "requestFramePermissions": []
+}
